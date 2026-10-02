@@ -883,7 +883,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=3.0.6" },
     { name = "pymupdf", specifier = ">=1.28.2" },
     { name = "python-dotenv", specifier = ">=1.2.4" },
-    { name = "sentence-transformers", specifier = ">=6.1.0" },
+    { name = "sentence-transformers", specifier = ">=3.0" },
     { name = "xlrd", specifier = "==2.0.1" },
 ]
 

@@ -20,7 +20,7 @@ from rag_assignment_civicdatalab.ingest import ingest_all
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "paraphrase-multilingual-mpnet-base-v2"
+MODEL_NAME = "BAAI/bge-m3"
 
 _encoder = None  # lazy-loaded
 
