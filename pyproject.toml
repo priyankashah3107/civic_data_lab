@@ -1,0 +1,23 @@
+[project]
+name = "rag-assignment-civicdatalab"
+version = "0.1.0"
+description = "RAG system over Indian government gender budget documents"
+readme = "README.md"
+authors = [
+    { name = "priyankashah3107", email = "priyankashah3107@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "groq>=1.7.0",
+    "numpy>=2.5.3",
+    "openpyxl>=3.1.5",
+    "pandas>=3.0.6",
+    "pymupdf>=1.28.2",
+    "python-dotenv>=1.2.4",
+    "sentence-transformers>=6.1.0",
+    "xlrd==2.0.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
