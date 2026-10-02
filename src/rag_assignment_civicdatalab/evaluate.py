@@ -47,7 +47,7 @@ def format_sources(sources: list[dict]) -> str:
 def run_evaluation(
     input_path: str | Path,
     output_path: str | Path | None = None,
-    top_k: int = 12,
+    top_k: int = 20,
     index_path: str | Path = "index.npz",
     chunks_path: str | Path = "chunks.json",
 ) -> list[dict]:
@@ -150,8 +150,8 @@ def run_evaluation(
         }
         results.append(result)
 
-        # Small delay between questions to stay within rate limits
-        time.sleep(1.5)
+        # Delay between questions to stay within free-tier rate limits (8000 TPM)
+        time.sleep(6)
 
     # Summary for dev
     if is_dev:

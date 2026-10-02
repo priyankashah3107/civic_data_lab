@@ -19,7 +19,7 @@ def main():
     parser = argparse.ArgumentParser(description="Query the Gender Budget RAG system.")
     parser.add_argument("question", nargs="?", help="Question to answer (or use --question)")
     parser.add_argument("-q", "--question", dest="question_flag", help="Question to answer")
-    parser.add_argument("--top-k", type=int, default=12, help="Number of chunks to retrieve")
+    parser.add_argument("--top-k", type=int, default=20, help="Number of chunks to retrieve")
     parser.add_argument("--index", default="index.npz", help="Path to index.npz")
     parser.add_argument("--chunks", default="chunks.json", help="Path to chunks.json")
     parser.add_argument("--show-chunks", action="store_true", help="Print retrieved chunk texts")
@@ -72,6 +72,16 @@ def main():
     # Generate
     try:
         result = generate_answer(question, chunks)
+    except RuntimeError as e:
+        err_msg = str(e)
+        if "rate" in err_msg.lower() or "429" in err_msg:
+            print(f"\n{'='*60}")
+            print("ERROR: Groq API rate limit hit after all retries.")
+            print("Wait 1-2 minutes and try again, or switch GROQ_MODEL in .env")
+            print(f"Details: {err_msg[:120]}")
+        else:
+            print(f"\nGeneration error: {e}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f"\nGeneration error: {e}", file=sys.stderr)
         sys.exit(1)

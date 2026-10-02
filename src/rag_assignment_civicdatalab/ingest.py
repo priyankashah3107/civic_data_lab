@@ -156,6 +156,44 @@ def _extract_scheme_subchunks(
     return subchunks
 
 
+def _extract_paragraph_subchunks(
+    text: str,
+    source_file: str,
+    page: int,
+    financial_year: Optional[str],
+    jurisdiction: Optional[str],
+    language: str,
+    min_len: int = 80,
+) -> list[dict]:
+    """
+    Split a page into paragraph-level sub-chunks (split on blank lines).
+    Used for Bihar narrative pages so individual facts (Rs.8/child, Jeevika etc.)
+    get dedicated embeddings without being diluted by the full page text.
+    """
+    # Split on double newlines (paragraph breaks)
+    raw_paras = re.split(r"\n\s*\n", text)
+    subchunks = []
+    for para in raw_paras:
+        para = para.strip()
+        if len(para) < min_len:
+            continue
+        # Skip if it's mostly numbers/whitespace (table rows)
+        alpha_ratio = sum(1 for c in para if c.isalpha()) / max(len(para), 1)
+        if alpha_ratio < 0.3:
+            continue
+        prefix = f"[{jurisdiction} {financial_year}] "
+        subchunks.append({
+            "text": prefix + para,
+            "source_file": source_file,
+            "page": page,
+            "financial_year": financial_year,
+            "jurisdiction": jurisdiction,
+            "language": language,
+            "part": None,
+        })
+    return subchunks
+
+
 def parse_pdf(path: str | Path) -> list[dict]:
     """
     Parse a PDF file page by page using PyMuPDF.
@@ -176,6 +214,7 @@ def parse_pdf(path: str | Path) -> list[dict]:
     jurisdiction = _jurisdiction_from_filename(stem)
     financial_year = _year_from_filename(stem)
     is_bilingual = jurisdiction == "Delhi"  # Delhi PDFs are bilingual with scheme-level data
+    is_bihar = jurisdiction == "Bihar"      # Bihar PDF is long English narrative — add para chunks
 
     chunks: list[dict] = []
 
@@ -225,6 +264,14 @@ def parse_pdf(path: str | Path) -> list[dict]:
         # For bilingual Delhi-style PDFs, also add scheme-level sub-chunks
         if is_bilingual and financial_year:
             sub = _extract_scheme_subchunks(
+                text, source_file, page_num + 1,
+                financial_year, jurisdiction, language
+            )
+            chunks.extend(sub)
+
+        # For Bihar (long English narrative pages), add paragraph-level sub-chunks
+        if is_bihar and financial_year:
+            sub = _extract_paragraph_subchunks(
                 text, source_file, page_num + 1,
                 financial_year, jurisdiction, language
             )

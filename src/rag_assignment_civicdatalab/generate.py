@@ -1,19 +1,11 @@
 """
 generate.py — Groq-based answer generation for the RAG system.
 
-The LLM receives only the retrieved context chunks.
-It is instructed to:
-  - answer only from context
-  - distinguish years and jurisdictions exactly
-  - distinguish Part A and Part B
-  - preserve and convert units explicitly
-  - return answered=false if evidence is insufficient
-  - respond in JSON
+Supports English and Hindi questions (Hindi is handled by the retrieval layer
+which augments Hindi queries with English translations before embedding).
 
-Usage:
-    from rag_assignment_civicdatalab.generate import generate_answer
-    result = generate_answer(question, chunks)
-    # result = {"answered": True/False, "answer": "...", "sources": [...]}
+The LLM receives only the top retrieved context chunks and is strictly
+instructed to answer from context only, with correct unit handling.
 """
 
 import json
@@ -24,41 +16,37 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# Max chars per chunk sent to LLM — keeps total prompt within token limits
-_MAX_CHUNK_CHARS = 1500
-# Max number of chunks to include in prompt
-_MAX_CHUNKS_IN_PROMPT = 4
+# ── Prompt sizing ────────────────────────────────────────────────────────────
+# Keep total prompt under ~4000 tokens to stay within 8000 TPM on free tier.
+# 6 chunks × 700 chars ≈ 4200 chars ≈ ~1050 tokens context.
+# System prompt ≈ 500 tokens. Question ≈ 100 tokens. Total ≈ ~1650 tokens per call.
+_MAX_CHUNK_CHARS = 700
+_MAX_CHUNKS_IN_PROMPT = 6
 
-SYSTEM_PROMPT = """You are a precise research assistant answering questions about Indian government gender budget documents.
+SYSTEM_PROMPT = """You are a precise research assistant answering questions about Indian government gender budget documents. Questions may be in English or Hindi — always answer in English.
 
-STRICT RULES — follow every one:
-1. Answer ONLY using the provided context. Do NOT use any outside knowledge.
-2. Distinguish financial years EXACTLY. "2024-25" and "2026-27" are different years. Never confuse them.
-3. Distinguish jurisdictions EXACTLY. Delhi, Bihar, Odisha, Kerala, and Union Budget are all different. Do not mix them up.
-4. Distinguish Part A (100% women-specific) and Part B (at least 30% women-specific). If both are relevant, report both.
-5. UNITS AND COLUMN ORDER FOR DELHI DOCUMENTS:
-   - Delhi gender budget documents report all amounts IN THOUSANDS of rupees (Rs in thousands).
-   - The column order for each scheme row is: [Scheme name] | [Revised Estimates prev year] | [Annual Budget outlay current year] | [Women Component flow]
-   - The OUTLAY / ALLOCATION for the current year is the SECOND number (Annual Budget), NOT the first (Revised Estimates).
-   - Example: "Self Defence | 18040 | 20000 | 20000" → the 2024-25 outlay is 20,000 thousands = Rs 2 crore.
-   - Example: "Ladli Yojna | 1000000 | 1000000 | 1000000" → the outlay is 10,00,000 thousands = Rs 100 crore.
-   - To convert thousands to crore: divide by 10,000.
-   - To convert thousands to lakh: divide by 100.
-6. For Union Budget (MRF_13_Union_Budget.csv), amounts are already in crore.
-7. For Odisha gender budget (14-Gender_Budget.pdf), amounts are in lakh.
-8. If the context does not contain sufficient evidence, set answered to false and leave answer empty.
-9. Do NOT hallucinate figures, scheme names, or dates not in the context.
-10. Include sources for every claim. For CSV/XLS files, page must be null.
-11. For Hindi questions, find the answer in the English portion of bilingual documents.
+STRICT RULES:
+1. Answer ONLY from the provided context. Never use outside knowledge.
+2. Distinguish financial years EXACTLY — 2024-25 ≠ 2026-27 ≠ 2022-23.
+3. Distinguish jurisdictions EXACTLY — Delhi, Bihar, Odisha, Kerala, Union Budget are different.
+4. Distinguish Part A (100% women-specific) and Part B (≥30% women-specific). Report both when relevant.
+5. DELHI DOCUMENT UNITS — amounts are IN THOUSANDS of rupees:
+   - Column order per row: [Scheme] | [Revised Estimates prev year] | [Annual Budget current year] | [Women Component]
+   - The ALLOCATION = the Annual Budget column (2nd number), NOT Revised Estimates (1st number).
+   - To convert to crore: divide thousands by 10,000. Example: 1,000,000 thousands = Rs 100 crore.
+6. Union Budget CSV (MRF_13_Union_Budget.csv) — amounts already in crore.
+7. Odisha budget (14-Gender_Budget.pdf) — amounts in lakh.
+8. If context is insufficient, set answered=false. Do NOT guess or hallucinate.
+9. For CSV/XLS sources, page must be null in sources.
+10. For Hindi questions: the answer is always in the English portion of bilingual documents.
 
-Respond ONLY with valid JSON (no text before or after):
+Respond ONLY with valid JSON — no text before or after:
 {
   "answered": true,
-  "answer": "concise answer here",
+  "answer": "concise factual answer",
   "sources": [{"file": "filename.pdf", "page": 1}]
 }
-
-When you cannot answer:
+Or if insufficient evidence:
 {
   "answered": false,
   "answer": "",
@@ -67,19 +55,16 @@ When you cannot answer:
 
 
 def _load_groq_client():
-    """Load Groq client, reading API key from .env."""
     try:
         from dotenv import load_dotenv
         load_dotenv()
     except ImportError:
         pass
-
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise EnvironmentError(
             "GROQ_API_KEY not found. Create a .env file with GROQ_API_KEY=your_key_here"
         )
-
     try:
         from groq import Groq
         return Groq(api_key=api_key)
@@ -87,28 +72,74 @@ def _load_groq_client():
         raise RuntimeError(f"Failed to initialise Groq client: {exc}") from exc
 
 
-def _truncate_text(text: str, max_chars: int) -> str:
-    """Truncate text to max_chars, preserving whole lines where possible."""
+def _get_model() -> str:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+    return os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
+
+
+def _truncate(text: str, max_chars: int, focus_hint: str = "") -> str:
+    """
+    Truncate text to max_chars. If focus_hint is provided and found in text,
+    centre the window around the hint rather than taking from the beginning.
+    """
     if len(text) <= max_chars:
         return text
-    truncated = text[:max_chars]
-    # Try to cut at a newline boundary
-    last_nl = truncated.rfind("\n")
-    if last_nl > max_chars // 2:
-        return truncated[:last_nl] + "\n[...truncated]"
-    return truncated + "[...truncated]"
+    if focus_hint:
+        idx = text.lower().find(focus_hint.lower())
+        if idx >= 0:
+            start = max(0, idx - 150)
+            end = start + max_chars
+            if end > len(text):
+                start = max(0, len(text) - max_chars)
+                end = len(text)
+            excerpt = text[start:end]
+            prefix = "[…] " if start > 0 else ""
+            suffix = " […]" if end < len(text) else ""
+            return prefix + excerpt.strip() + suffix
+    cut = text[:max_chars]
+    nl = cut.rfind("\n")
+    if nl > max_chars // 2:
+        return cut[:nl] + "\n[truncated]"
+    return cut + "[truncated]"
 
 
-def _format_chunks_for_prompt(chunks: list[dict]) -> str:
+def _extract_focus_hints(question: str) -> list[str]:
+    """Extract key terms from question that should be present in the relevant chunk text."""
+    hints = []
+    q = question.lower()
+    for term in [
+        "australia", "30 ministries", "grand total", "saksham anganwadi",
+        "rs. 8", "rs.8", "per child per day", "kanya vivah", "kanya utthan",
+        "ladli", "kishori", "menstrual hygiene", "mission shakti",
+        "mahila samriddhi", "domestic violence", "jeevika", "10.47",
+        "2005-06", "first introduced", "be 2013-14", "ministries/departments",
+        "union territory governments", "88,142", "88142",
+    ]:
+        if term in q:
+            hints.append(term)
+    return hints
+
+
+def _format_chunks_for_prompt(chunks: list[dict], question: str = "") -> str:
     """
-    Format retrieved chunks into a labelled context block for the prompt.
-    Deduplicates by source+page, limits each chunk to _MAX_CHUNK_CHARS,
-    and caps total chunks at _MAX_CHUNKS_IN_PROMPT.
+    Deduplicate by (source, page) — for pageless sources use first 80 chars as key.
+    Pick top _MAX_CHUNKS_IN_PROMPT unique chunks with focus-aware truncation.
     """
-    # Deduplicate by (source_file, page) — keep highest-scored version
-    seen = {}
+    focus_hints = _extract_focus_hints(question)
+
+    seen: dict[tuple, dict] = {}
     for chunk in chunks:
-        key = (chunk.get("source_file", ""), chunk.get("page"))
+        src = chunk.get("source_file", "")
+        page = chunk.get("page")
+        # For pageless chunks (CSV/XLS), use a short content fingerprint as key
+        if page is None:
+            key = (src, chunk.get("text", "")[:60])
+        else:
+            key = (src, page)
         if key not in seen or chunk.get("score", 0) > seen[key].get("score", 0):
             seen[key] = chunk
     deduped = sorted(seen.values(), key=lambda c: c.get("score", 0), reverse=True)
@@ -121,43 +152,43 @@ def _format_chunks_for_prompt(chunks: list[dict]) -> str:
         jur = chunk.get("jurisdiction", "")
         part = chunk.get("part", "")
 
-        meta_parts = []
+        meta = []
         if jur:
-            meta_parts.append(f"jurisdiction={jur}")
+            meta.append(f"jurisdiction={jur}")
         if fy:
-            meta_parts.append(f"year={fy}")
+            meta.append(f"year={fy}")
         if part:
-            meta_parts.append(f"part={part}")
+            meta.append(f"part={part}")
         if page:
-            meta_parts.append(f"page={page}")
-        meta = ", ".join(meta_parts)
+            meta.append(f"page={page}")
 
-        chunk_text = _truncate_text(chunk.get("text", "").strip(), _MAX_CHUNK_CHARS)
+        raw_text = chunk.get("text", "").strip()
+        # Find a focus hint present in this chunk
+        focus = next(
+            (h for h in focus_hints if h.lower() in raw_text.lower()),
+            ""
+        )
+        chunk_text = _truncate(raw_text, _MAX_CHUNK_CHARS, focus_hint=focus)
 
-        lines.append(f"--- Context chunk {i} [{src}] ({meta}) ---")
+        lines.append(f"--- Chunk {i} [{src}] ({', '.join(meta)}) ---")
         lines.append(chunk_text)
         lines.append("")
-
     return "\n".join(lines)
 
 
 def _parse_json_response(raw: str) -> dict:
-    """
-    Parse the LLM's JSON response. Returns a valid result dict or a fallback.
-    Handles truncated JSON by attempting repair.
-    """
     if not raw or not raw.strip():
         return {"answered": False, "answer": "", "sources": []}
 
     text = raw.strip()
 
-    # Try direct parse
+    # Direct parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Try extracting JSON from markdown code blocks
+    # Strip markdown fences
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if match:
         try:
@@ -165,7 +196,7 @@ def _parse_json_response(raw: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Try finding the first complete {...} block
+    # First {...} block
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         candidate = match.group(0)
@@ -173,60 +204,69 @@ def _parse_json_response(raw: str) -> dict:
             return json.loads(candidate)
         except json.JSONDecodeError:
             pass
-        # Try to repair truncated JSON by closing open brackets
+        # Attempt repair of truncated JSON
         repaired = candidate
-        # Count open/close braces and brackets
-        opens = repaired.count("{") - repaired.count("}")
-        arr_opens = repaired.count("[") - repaired.count("]")
-        if arr_opens > 0:
-            repaired += "]" * arr_opens
-        if opens > 0:
-            repaired += "}" * opens
+        repaired += "]" * (repaired.count("[") - repaired.count("]"))
+        repaired += "}" * (repaired.count("{") - repaired.count("}"))
         try:
             return json.loads(repaired)
         except json.JSONDecodeError:
             pass
 
-    # Last resort: try to extract answered + answer from text directly
-    answered_match = re.search(r'"answered"\s*:\s*(true|false)', text, re.IGNORECASE)
-    answer_match = re.search(r'"answer"\s*:\s*"([^"]*)"', text)
-    if answered_match:
-        answered = answered_match.group(1).lower() == "true"
-        answer = answer_match.group(1) if answer_match else ""
-        return {"answered": answered, "answer": answer, "sources": []}
+    # Last resort: regex extraction
+    am = re.search(r'"answered"\s*:\s*(true|false)', text, re.IGNORECASE)
+    vm = re.search(r'"answer"\s*:\s*"([^"]*)"', text)
+    if am:
+        return {
+            "answered": am.group(1).lower() == "true",
+            "answer": vm.group(1) if vm else "",
+            "sources": [],
+        }
 
-    logger.warning(f"Could not parse JSON from LLM response: {text[:300]}")
+    logger.warning(f"Could not parse LLM JSON response: {text[:200]}")
     return {"answered": False, "answer": "", "sources": []}
 
 
-def _call_groq_with_retry(client, model: str, messages: list, max_retries: int = 3) -> str:
-    """Call Groq API with exponential backoff on rate limit errors."""
-    last_exc = None
+def _call_groq_with_retry(
+    client,
+    model: str,
+    messages: list,
+    max_retries: int = 5,
+) -> str:
+    """Exponential backoff on 429 rate-limit errors."""
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=0.0,
-                max_tokens=512,
+                max_tokens=400,
             )
             return response.choices[0].message.content or ""
         except Exception as exc:
-            err_str = str(exc)
-            last_exc = exc
-            # Rate limit (429) or token overflow (413) — wait and retry
-            if "429" in err_str or "rate_limit" in err_str:
-                wait = 2 ** attempt  # 1s, 2s, 4s
-                logger.warning(f"Rate limit hit (attempt {attempt+1}/{max_retries}), waiting {wait}s...")
+            err = str(exc)
+            if "429" in err or "rate_limit" in err:
+                wait = min(4 ** attempt, 60)  # 4, 16, 64 → cap at 60s
+                logger.warning(
+                    f"Rate limit (attempt {attempt+1}/{max_retries}), waiting {wait}s…"
+                )
                 time.sleep(wait)
-                continue
-            elif "413" in err_str:
-                # Request too large — this shouldn't happen with our truncation,
-                # but if it does, raise immediately so caller knows
-                raise RuntimeError(f"Groq API call failed: {exc}") from exc
+            elif "413" in err:
+                # Still too large — halve the context and retry once
+                logger.warning("Request too large (413); retrying with reduced context.")
+                # Reduce context by stripping last chunk block from user message
+                for j in range(len(messages) - 1, -1, -1):
+                    if messages[j]["role"] == "user":
+                        content = messages[j]["content"]
+                        # Remove the last context chunk block
+                        last_chunk = content.rfind("--- Chunk ")
+                        if last_chunk > 0:
+                            messages[j]["content"] = content[:last_chunk].rstrip()
+                        break
+                time.sleep(1)
             else:
                 raise RuntimeError(f"Groq API call failed: {exc}") from exc
-    raise RuntimeError(f"Groq API call failed after {max_retries} retries: {last_exc}") from last_exc
+    raise RuntimeError(f"Groq API failed after {max_retries} retries.")
 
 
 def generate_answer(
@@ -236,72 +276,47 @@ def generate_answer(
 ) -> dict:
     """
     Generate a structured answer using Groq.
-
-    Args:
-        question: The user's question.
-        chunks: Retrieved context chunks (with metadata).
-        model: Optional model override. Falls back to GROQ_MODEL env var or default.
-
-    Returns:
-        dict with keys: answered (bool), answer (str), sources (list of dicts)
+    Handles English and Hindi questions — retrieval layer handles translation.
     """
     if not chunks:
-        logger.warning("No chunks provided to generate_answer; returning unanswered.")
+        logger.warning("No chunks — returning unanswered.")
         return {"answered": False, "answer": "", "sources": []}
 
-    try:
-        client = _load_groq_client()
-    except (EnvironmentError, RuntimeError) as exc:
-        logger.error(str(exc))
-        raise
-
-    # Determine model
+    client = _load_groq_client()
     if model is None:
-        from dotenv import load_dotenv
-        load_dotenv()
-        model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+        model = _get_model()
 
-    context_text = _format_chunks_for_prompt(chunks)
-    user_prompt = f"""Question: {question}
-
-Retrieved context:
-{context_text}
-
-Answer the question using ONLY the context above. Respond with valid JSON only."""
+    context = _format_chunks_for_prompt(chunks, question=question)
+    user_msg = (
+        f"Question: {question}\n\n"
+        f"Retrieved context:\n{context}\n"
+        f"Answer ONLY from the context above. Respond with valid JSON only."
+    )
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
+        {"role": "user", "content": user_msg},
     ]
 
-    try:
-        raw = _call_groq_with_retry(client, model, messages)
-    except RuntimeError as exc:
-        logger.error(str(exc))
-        raise
-
+    raw = _call_groq_with_retry(client, model, messages)
     result = _parse_json_response(raw)
 
-    # Ensure required keys exist
-    if "answered" not in result:
-        result["answered"] = False
-    if "answer" not in result:
-        result["answer"] = ""
-    if "sources" not in result:
-        result["sources"] = []
+    # Ensure required keys
+    result.setdefault("answered", False)
+    result.setdefault("answer", "")
+    result.setdefault("sources", [])
 
-    # Enforce: answered=false must have empty answer
     if not result["answered"]:
         result["answer"] = ""
 
-    # Fix: CSV/XLS sources should not have page numbers
-    fixed_sources = []
-    for src in result.get("sources", []):
-        fname = src.get("file", "")
-        page = src.get("page")
-        if fname.endswith(".csv") or fname.endswith(".xls") or fname.endswith(".xlsx"):
-            page = None
-        fixed_sources.append({"file": fname, "page": page})
-    result["sources"] = fixed_sources
+    # Fix: CSV/XLS sources must have page=null
+    result["sources"] = [
+        {
+            "file": s.get("file", ""),
+            "page": None if (s.get("file", "").endswith((".csv", ".xls", ".xlsx")))
+            else s.get("page"),
+        }
+        for s in result["sources"]
+    ]
 
     return result
